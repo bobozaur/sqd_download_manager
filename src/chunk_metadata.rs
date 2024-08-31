@@ -108,10 +108,7 @@ impl Drop for DataChunkMetadata {
         // Only delete the chunk if the download manager is live.
         if self.can_delete.load(Ordering::Acquire) {
             let future = Self::delete_chunk(self.path.clone());
-            self.manager_tasks
-                .lock()
-                .unwrap()
-                .push(tokio::spawn(future));
+            self.manager_tasks.lock().unwrap().spawn(future);
         }
     }
 }

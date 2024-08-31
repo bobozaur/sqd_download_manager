@@ -11,15 +11,15 @@ pub enum DownloadManagerError {
     #[error("IO error: {0}")]
     Io(#[from] IoError),
     #[error("chunk download error: {0}")]
-    Download(#[from] DownloadError),
+    BackgroundTask(#[from] TaskError),
     #[error("data chunk error: {0}")]
     DataChunk(#[from] DataChunkError),
 }
 
 #[derive(Debug, ThisError)]
-pub enum DownloadError {
+pub enum TaskError {
     #[error("download request error: {0}")]
-    RequestError(#[from] ReqError),
+    DownloadRequest(#[from] ReqError),
     #[error("download IO error: {0}")]
     Io(#[from] IoError),
     #[error("download task joining error: {0}")]

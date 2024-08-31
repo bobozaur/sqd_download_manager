@@ -6,21 +6,20 @@ use std::{
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
+use futures::FutureExt;
 use reqwest::{Client, Url};
-use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
-    task::{JoinHandle, JoinSet},
-};
+use tokio::{fs::File, io::AsyncWriteExt, task::JoinSet};
 
 use crate::{
     chunk_metadata::DataChunkMetadata,
     chunk_tracker::ChunkTracker,
-    error::{DataChunkError, DownloadError, DownloadManagerResult, InvalidHexIdError},
+    error::{
+        DataChunkError, DownloadManagerError, DownloadManagerResult, InvalidHexIdError, TaskError,
+    },
     ChunkId, DataChunk, DataChunkRef, DataManager, DatasetId,
 };
 
-pub type BackgroundTasks = Arc<Mutex<Vec<JoinHandle<DownloadManagerResult<()>>>>>;
+pub type BackgroundTasks = Arc<Mutex<JoinSet<DownloadManagerResult<()>>>>;
 
 #[derive(Debug, Clone)]
 pub struct DownloadManager {
@@ -35,9 +34,9 @@ pub struct DownloadManager {
 }
 
 impl DownloadManager {
-    pub(crate) const FILENAME_PART_SEPARATOR: &'static str = "_";
-    pub(crate) const DELETE_CHUNK_MARKER: &'static str = "DELETE";
-    pub(crate) const INCOMPLETE_FILE_MARKER: &'static str = "INCOMPLETE";
+    pub const FILENAME_PART_SEPARATOR: &'static str = "_";
+    pub const DELETE_CHUNK_MARKER: &'static str = "DELETE";
+    pub const INCOMPLETE_CHUNK_MARKER: &'static str = "INCOMPLETE";
 
     /// Creates a new [`DownloadManager`] that stores chunks at the given `base_path`.
     ///
@@ -58,7 +57,7 @@ impl DownloadManager {
         let base_path = Arc::from(base_path.as_ref());
         let http_client = Client::new();
         let chunk_tracker = Arc::new(RwLock::new(ChunkTracker::default()));
-        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let tasks = Arc::new(Mutex::new(JoinSet::new()));
 
         let mut manager = Self {
             http_client,
@@ -78,9 +77,9 @@ impl DownloadManager {
     /// background tasks to finish.
     #[allow(clippy::missing_panics_doc)]
     pub async fn wait_bg_tasks(&self) {
-        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
-        for handle in tasks {
-            if let Err(e) = handle.await {
+        let tasks = std::mem::replace(&mut *self.tasks.lock().unwrap(), JoinSet::new());
+        for res in tasks.join_all().await {
+            if let Err(e) = res {
                 tracing::error!("error when waiting for download tasks: {e}");
             }
         }
@@ -141,6 +140,9 @@ impl DownloadManager {
                 // This means only one more part is present, particularly one that signals the chunk
                 // was marked for deletion.
                 (Some(s), None) if s == Self::DELETE_CHUNK_MARKER => should_delete = true,
+                // This means only one more part is present, particularly one that signals the chunk
+                // was being downloaded but the download did not complete.
+                (Some(s), None) if s == Self::INCOMPLETE_CHUNK_MARKER => should_delete = true,
                 // Erroring out here could be another option, but that would prevent the
                 // [`DownloadManager`] from starting without manual intervention.
                 //
@@ -150,26 +152,6 @@ impl DownloadManager {
                 _ => {
                     invalid_dir_fn(&dir_path);
                     continue;
-                }
-            }
-
-            tracing::info!("reading chunk dir contents: {}", dir_path.display());
-            let mut files = tokio::fs::read_dir(&dir_path).await?;
-
-            // Check if all files from the chunk were completely downloaded.
-            // Otherwise we delete this chunk since it's incomplete.
-            while let Some(file) = files.next_entry().await? {
-                tracing::debug!("found chunk file: {}", file.path().display());
-
-                let is_file_complete = file
-                    .path()
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .map_or(true, |n| !n.ends_with(Self::INCOMPLETE_FILE_MARKER));
-
-                if !is_file_complete {
-                    should_delete = true;
-                    break;
                 }
             }
 
@@ -221,19 +203,21 @@ impl DownloadManager {
             id,
             dataset_id,
             block_range,
+            tmp_dir_path,
             dir_path,
             download_details,
         } = chunk_file_info;
 
         // Create chunk directory, where we'll store the files.
         tracing::info!("creating chunk directory");
-        tokio::fs::create_dir(&dir_path).await?;
+
+        tokio::fs::create_dir(&tmp_dir_path).await?;
 
         let mut join_set = JoinSet::new();
 
         // Spawn all file downloads concurrently.
-        for (tmp_file_path, file_path, url) in download_details {
-            let future = Self::download_file(http_client.clone(), tmp_file_path, file_path, url);
+        for (file_path, url) in download_details {
+            let future = Self::download_file(http_client.clone(), file_path, url);
             join_set.spawn(future);
         }
 
@@ -242,7 +226,7 @@ impl DownloadManager {
 
         while let Some(res) = join_set.join_next().await {
             // If an error occurred, abort the other file download tasks and propagate it.
-            if let Err(e) = res.map_err(DownloadError::JoinTask).and_then(|res| res) {
+            if let Err(e) = res.map_err(TaskError::JoinTask).and_then(|res| res) {
                 tracing::error!("download error occurred: {e}");
 
                 // If this is the first error, then store it and abort the other tasks.
@@ -256,9 +240,12 @@ impl DownloadManager {
         // If download failed we should purge the chunk directory.
         if let Err(e) = download_res {
             tracing::info!("removing chunk directory because download failed");
-            tokio::fs::remove_dir_all(&dir_path).await?;
+            tokio::fs::remove_dir_all(&tmp_dir_path).await?;
             return Err(e)?;
         }
+
+        // Rename the chunk dir to reflect that it is now complete.
+        tokio::fs::rename(tmp_dir_path, &dir_path).await?;
 
         // Otherwise track the chunk.
         let chunk_metadata = DataChunkMetadata::new(
@@ -278,25 +265,40 @@ impl DownloadManager {
         Ok(())
     }
 
-    /// Method that downloads a single chunk file, first to a temporary file path
-    /// to then rename the file to it's final name.
+    /// Method that downloads a single chunk file.
     #[tracing::instrument(skip(http_client), err(Debug))]
     async fn download_file(
         http_client: Client,
-        tmp_file_path: PathBuf,
         file_path: PathBuf,
         url: Url,
-    ) -> Result<(), DownloadError> {
+    ) -> Result<(), TaskError> {
         let mut response = http_client.get(url).send().await?;
-        let mut file = File::create_new(&tmp_file_path).await?;
+        let mut file = File::create_new(&file_path).await?;
 
         while let Some(data) = response.chunk().await? {
             file.write_all(&data).await?;
         }
 
-        tokio::fs::rename(tmp_file_path, &file_path).await?;
-
         Ok(())
+    }
+
+    /// Method used for evicting finished background tasks so as not to uncontrollably grow within
+    /// the [`DownloadManager`].
+    ///
+    /// This is achieved by polling the [`JoinSet`] only once, continuing to do so until a
+    /// background task would pend.
+    fn evict_finished_tasks(&self) {
+        let mut tasks = self.tasks.lock().unwrap();
+        while let Some(res) = tasks.join_next().now_or_never().flatten() {
+            let res = res
+                .map_err(TaskError::JoinTask)
+                .map_err(DownloadManagerError::BackgroundTask)
+                .and_then(|res| res);
+
+            if let Err(e) = res {
+                tracing::error!("background task finished with error: {e}");
+            }
+        }
     }
 
     fn hex_id_to_bytes(s: &str) -> Result<[u8; 32], InvalidHexIdError> {
@@ -325,6 +327,9 @@ impl DownloadManager {
 
 impl DataManager for DownloadManager {
     fn download_chunk(&self, chunk: &DataChunk) {
+        // Check to see if any background task has finished and evict it if so.
+        self.evict_finished_tasks();
+
         // This chunk dir naming scheme allows us to restore the chunk tracker's state.
         let dir_name = format!(
             "{dataset_id:02X}{sep}{chunk_id:02X}{sep}{start_block}{sep}{end_block}",
@@ -336,6 +341,10 @@ impl DataManager for DownloadManager {
         );
 
         let dir_path: Arc<Path> = self.base_path.join(dir_name).into();
+        let mut tmp_dir_path = dir_path.as_os_str().to_owned();
+        tmp_dir_path.push(Self::FILENAME_PART_SEPARATOR);
+        tmp_dir_path.push(Self::INCOMPLETE_CHUNK_MARKER);
+        let tmp_dir_path: PathBuf = tmp_dir_path.into();
 
         // Closure that parses the file name and URL and generates both the temporary as well as
         // final file.
@@ -344,16 +353,8 @@ impl DataManager for DownloadManager {
                 return None;
             };
 
-            let tmp_file_name = format!(
-                "{file}{}{}",
-                DownloadManager::FILENAME_PART_SEPARATOR,
-                DownloadManager::INCOMPLETE_FILE_MARKER
-            );
-
-            let tmp_file_path = dir_path.join(tmp_file_name);
-            let file_path = dir_path.join(file);
-
-            Some((tmp_file_path, file_path, url))
+            let file_path = tmp_dir_path.join(file);
+            Some((file_path, url))
         };
 
         let download_details: Vec<_> = chunk.files.iter().filter_map(chunk_files_fn).collect();
@@ -367,7 +368,8 @@ impl DataManager for DownloadManager {
             id: chunk.id,
             dataset_id: chunk.dataset_id,
             block_range: chunk.block_range.clone(),
-            dir_path: dir_path.clone(),
+            tmp_dir_path,
+            dir_path,
             download_details,
         };
 
@@ -385,7 +387,7 @@ impl DataManager for DownloadManager {
             can_delete,
         );
 
-        self.tasks.lock().unwrap().push(tokio::spawn(future));
+        self.tasks.lock().unwrap().spawn(future);
     }
 
     fn list_chunks(&self) -> Vec<ChunkId> {
@@ -410,6 +412,8 @@ impl DataManager for DownloadManager {
     }
 
     fn delete_chunk(&self, chunk_id: ChunkId) {
+        // Check to see if any background task has finished and evict it if so.
+        self.evict_finished_tasks();
         self.chunk_tracker.write().unwrap().remove_chunk(chunk_id);
     }
 }
@@ -420,8 +424,9 @@ struct ChunkFileInfo {
     id: ChunkId,
     dataset_id: DatasetId,
     block_range: Range<u64>,
+    tmp_dir_path: PathBuf,
     dir_path: Arc<Path>,
-    download_details: Vec<(PathBuf, PathBuf, Url)>,
+    download_details: Vec<(PathBuf, Url)>,
 }
 
 struct UpperHexArray([u8; 32]);

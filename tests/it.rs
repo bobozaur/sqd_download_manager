@@ -209,3 +209,101 @@ async fn test_chunk_not_resuming() {
     // Check that the restore did not take place.
     assert!(setup.manager.list_chunks().is_empty());
 }
+
+#[tokio::test]
+async fn test_chunk_marked_for_deletion() {
+    let mut setup = TestSetup::new().await;
+
+    let block_range = 0..NUM_BLOCKS;
+    let files = (0..NUM_BLOCKS)
+        .map(|i| (i.to_string(), setup.server.url()))
+        .collect();
+    let data_chunk = DataChunk::new(DEFAULT_ID, DEFAULT_ID, block_range, files);
+
+    // New manager should contain no chunks.
+    assert!(setup.manager.list_chunks().is_empty());
+
+    setup.manager.download_chunk(&data_chunk);
+    setup.manager.wait_bg_tasks().await;
+    setup.mock.assert_async().await;
+
+    // We should have a chunk now.
+    assert_eq!(setup.manager.list_chunks().len(), 1);
+
+    // Manually mark the chunk for deletion.
+    let chunk_dir_path = setup
+        .manager
+        .find_chunk(DEFAULT_ID, CHUNK_REF_BLOCK)
+        .unwrap()
+        .path()
+        .as_os_str()
+        .to_owned();
+
+    let mut chunk_to_delete_path = chunk_dir_path.clone();
+
+    chunk_to_delete_path.push(DownloadManager::FILENAME_PART_SEPARATOR);
+    chunk_to_delete_path.push(DownloadManager::DELETE_CHUNK_MARKER);
+
+    tokio::fs::rename(&chunk_dir_path, &chunk_to_delete_path)
+        .await
+        .unwrap();
+
+    // Replace the download manager
+    setup.manager = DownloadManager::new(&setup.temp_dir, None).await.unwrap();
+
+    // Check that the chunk is no longer present.
+    assert!(!tokio::fs::try_exists(&chunk_dir_path).await.unwrap());
+    assert!(!tokio::fs::try_exists(&chunk_to_delete_path).await.unwrap());
+
+    // Check that the restore took place and the chunk marked for deletion was deleted.
+    assert!(setup.manager.list_chunks().is_empty());
+}
+
+#[tokio::test]
+async fn test_chunk_marked_as_incomplete() {
+    let mut setup = TestSetup::new().await;
+
+    let block_range = 0..NUM_BLOCKS;
+    let files = (0..NUM_BLOCKS)
+        .map(|i| (i.to_string(), setup.server.url()))
+        .collect();
+    let data_chunk = DataChunk::new(DEFAULT_ID, DEFAULT_ID, block_range, files);
+
+    // New manager should contain no chunks.
+    assert!(setup.manager.list_chunks().is_empty());
+
+    setup.manager.download_chunk(&data_chunk);
+    setup.manager.wait_bg_tasks().await;
+    setup.mock.assert_async().await;
+
+    // We should have a chunk now.
+    assert_eq!(setup.manager.list_chunks().len(), 1);
+
+    // Manually mark the chunk as incomplete.
+    let chunk_dir_path = setup
+        .manager
+        .find_chunk(DEFAULT_ID, CHUNK_REF_BLOCK)
+        .unwrap()
+        .path()
+        .as_os_str()
+        .to_owned();
+
+    let mut incomplete_chunk_path = chunk_dir_path.clone();
+
+    incomplete_chunk_path.push(DownloadManager::FILENAME_PART_SEPARATOR);
+    incomplete_chunk_path.push(DownloadManager::INCOMPLETE_CHUNK_MARKER);
+
+    tokio::fs::rename(&chunk_dir_path, &incomplete_chunk_path)
+        .await
+        .unwrap();
+
+    // Replace the download manager
+    setup.manager = DownloadManager::new(&setup.temp_dir, None).await.unwrap();
+
+    // Check that the chunk is no longer present.
+    assert!(!tokio::fs::try_exists(&chunk_dir_path).await.unwrap());
+    assert!(!tokio::fs::try_exists(&incomplete_chunk_path).await.unwrap());
+
+    // Check that the restore took place and the chunk marked as incomplete was deleted.
+    assert!(setup.manager.list_chunks().is_empty());
+}
