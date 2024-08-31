@@ -14,6 +14,22 @@ pub use manager::DownloadManager;
 #[rustfmt::skip]
 pub use chunk_metadata::DataChunkMetadata;
 
+impl DataChunk {
+    pub fn new(
+        id: ChunkId,
+        dataset_id: DatasetId,
+        block_range: Range<u64>,
+        files: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            id,
+            dataset_id,
+            block_range,
+            files,
+        }
+    }
+}
+
 // ###################################
 // ##########               ##########
 // ########## Provided code ##########

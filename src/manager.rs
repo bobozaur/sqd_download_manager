@@ -1,12 +1,17 @@
 use std::{
     ffi::OsStr,
+    fmt::UpperHex,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
 use reqwest::{Client, Url};
-use tokio::{fs::File, io::AsyncWriteExt, task::JoinSet};
+use tokio::{
+    fs::File,
+    io::AsyncWriteExt,
+    task::{JoinHandle, JoinSet},
+};
 
 use crate::{
     chunk_metadata::DataChunkMetadata,
@@ -15,11 +20,18 @@ use crate::{
     ChunkId, DataChunk, DataChunkRef, DataManager, DatasetId,
 };
 
-#[derive(Debug)]
+pub type BackgroundTasks = Arc<Mutex<Vec<JoinHandle<DownloadManagerResult<()>>>>>;
+
+#[derive(Debug, Clone)]
 pub struct DownloadManager {
+    /// Client used for HTTP requests when downloading chunks.
     http_client: Client,
+    /// Base path where chunks are stored.
     base_path: Arc<Path>,
+    /// Chunk tracker that holds maps to locate chunks.
     chunk_tracker: Arc<RwLock<ChunkTracker>>,
+    /// Background tasks that the download manager is responsible for.
+    tasks: BackgroundTasks,
 }
 
 impl DownloadManager {
@@ -46,25 +58,42 @@ impl DownloadManager {
         let base_path = Arc::from(base_path.as_ref());
         let http_client = Client::new();
         let chunk_tracker = Arc::new(RwLock::new(ChunkTracker::default()));
+        let tasks = Arc::new(Mutex::new(Vec::new()));
 
         let mut manager = Self {
             http_client,
             base_path,
             chunk_tracker,
+            tasks,
         };
 
         if resume.unwrap_or(true) {
-            manager.resume().await?;
+            manager.restore().await?;
         }
 
         Ok(manager)
     }
 
+    /// Method meant for graceful termination of the [`DownloadManager`] by waiting for all the
+    /// background tasks to finish.
+    #[allow(clippy::missing_panics_doc)]
+    pub async fn wait_bg_tasks(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for handle in tasks {
+            if let Err(e) = handle.await {
+                tracing::error!("error when waiting for download tasks: {e}");
+            }
+        }
+    }
+
     /// Resumes the [`DownloadManager`] from its previous state by reading the chunks stored at
     /// the given `base_path`.
     #[tracing::instrument(skip(self), err(Debug))]
-    async fn resume(&mut self) -> DownloadManagerResult<()> {
-        let mut dirs = tokio::fs::read_dir(&self.base_path).await?;
+    async fn restore(&mut self) -> DownloadManagerResult<()> {
+        tracing::info!(
+            base_path = format_args!("{}", self.base_path.display()),
+            "attempting to resume download manager's state"
+        );
 
         // Closure that logs a warning if the chunk directory name is invalid.
         let invalid_dir_fn = |path: &Path| {
@@ -75,9 +104,13 @@ impl DownloadManager {
             );
         };
 
+        let mut dirs = tokio::fs::read_dir(&self.base_path).await?;
+
         // Read each chunk directory from the base path.
         while let Some(dir) = dirs.next_entry().await? {
             let dir_path = dir.path();
+            tracing::info!("encountered dir: {}", dir_path.display());
+
             let mut should_delete = false;
 
             let Some(dir_name) = dir_path.file_name().and_then(OsStr::to_str) else {
@@ -120,16 +153,19 @@ impl DownloadManager {
                 }
             }
 
-            let mut files = tokio::fs::read_dir(&self.base_path).await?;
+            tracing::info!("reading chunk dir contents: {}", dir_path.display());
+            let mut files = tokio::fs::read_dir(&dir_path).await?;
 
             // Check if all files from the chunk were completely downloaded.
             // Otherwise we delete this chunk since it's incomplete.
             while let Some(file) = files.next_entry().await? {
+                tracing::debug!("found chunk file: {}", file.path().display());
+
                 let is_file_complete = file
                     .path()
                     .file_name()
                     .and_then(OsStr::to_str)
-                    .is_some_and(|n| n.ends_with(Self::INCOMPLETE_FILE_MARKER));
+                    .map_or(true, |n| !n.ends_with(Self::INCOMPLETE_FILE_MARKER));
 
                 if !is_file_complete {
                     should_delete = true;
@@ -139,14 +175,25 @@ impl DownloadManager {
 
             // Delete the chunk if necessary.
             if should_delete {
+                tracing::info!("deleting malformed chunk: {}", dir_path.display());
                 tokio::fs::remove_dir_all(dir_path).await?;
                 continue;
             }
 
             // Otherwise the chunk is complete, so store it in the tracker.
+            tracing::info!("tracking chunk: {}", dir_path.display());
+
             let block_range = start_block..end_block;
-            let chunk_metadata =
-                DataChunkMetadata::new(id, dataset_id, block_range.clone(), dir_path.into());
+            let can_delete = Arc::new(AtomicBool::new(false));
+
+            let chunk_metadata = DataChunkMetadata::new(
+                id,
+                dataset_id,
+                block_range.clone(),
+                dir_path.into(),
+                self.tasks.clone(),
+                can_delete,
+            );
 
             self.chunk_tracker.write().unwrap().add_chunk(
                 dataset_id,
@@ -167,6 +214,8 @@ impl DownloadManager {
         http_client: Client,
         chunk_file_info: ChunkFileInfo,
         chunk_tracker: Arc<RwLock<ChunkTracker>>,
+        manager_tasks: BackgroundTasks,
+        can_delete: Arc<AtomicBool>,
     ) -> DownloadManagerResult<()> {
         let ChunkFileInfo {
             id,
@@ -177,6 +226,7 @@ impl DownloadManager {
         } = chunk_file_info;
 
         // Create chunk directory, where we'll store the files.
+        tracing::info!("creating chunk directory");
         tokio::fs::create_dir(&dir_path).await?;
 
         let mut join_set = JoinSet::new();
@@ -205,11 +255,20 @@ impl DownloadManager {
 
         // If download failed we should purge the chunk directory.
         if let Err(e) = download_res {
+            tracing::info!("removing chunk directory because download failed");
             tokio::fs::remove_dir_all(&dir_path).await?;
             return Err(e)?;
         }
 
-        let chunk_metadata = DataChunkMetadata::new(id, dataset_id, block_range.clone(), dir_path);
+        // Otherwise track the chunk.
+        let chunk_metadata = DataChunkMetadata::new(
+            id,
+            dataset_id,
+            block_range.clone(),
+            dir_path,
+            manager_tasks,
+            can_delete,
+        );
 
         chunk_tracker
             .write()
@@ -266,11 +325,12 @@ impl DownloadManager {
 
 impl DataManager for DownloadManager {
     fn download_chunk(&self, chunk: &DataChunk) {
+        // This chunk dir naming scheme allows us to restore the chunk tracker's state.
         let dir_name = format!(
-            "{dataset_id:02X?}{sep}{chunk_id:02X?}{sep}{start_block}{sep}{end_block}",
+            "{dataset_id:02X}{sep}{chunk_id:02X}{sep}{start_block}{sep}{end_block}",
             sep = DownloadManager::FILENAME_PART_SEPARATOR,
-            dataset_id = chunk.dataset_id,
-            chunk_id = chunk.id,
+            dataset_id = UpperHexArray(chunk.dataset_id),
+            chunk_id = UpperHexArray(chunk.id),
             start_block = chunk.block_range.start,
             end_block = chunk.block_range.end
         );
@@ -313,10 +373,19 @@ impl DataManager for DownloadManager {
 
         let http_client = self.http_client.clone();
         let chunk_tracker = self.chunk_tracker.clone();
+        let manager_tasks = self.tasks.clone();
+        let can_delete = Arc::new(AtomicBool::new(false));
 
         // Start the chunk download in the background
-        let future = Self::_download_chunk(http_client, chunk_file_info, chunk_tracker);
-        tokio::spawn(future);
+        let future = Self::_download_chunk(
+            http_client,
+            chunk_file_info,
+            chunk_tracker,
+            manager_tasks,
+            can_delete,
+        );
+
+        self.tasks.lock().unwrap().push(tokio::spawn(future));
     }
 
     fn list_chunks(&self) -> Vec<ChunkId> {
@@ -353,4 +422,16 @@ struct ChunkFileInfo {
     block_range: Range<u64>,
     dir_path: Arc<Path>,
     download_details: Vec<(PathBuf, PathBuf, Url)>,
+}
+
+struct UpperHexArray([u8; 32]);
+
+impl UpperHex for UpperHexArray {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02X}")?;
+        }
+
+        Ok(())
+    }
 }

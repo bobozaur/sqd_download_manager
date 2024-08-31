@@ -44,6 +44,8 @@ impl ChunkTracker {
             if let Some(m) = self.dataset_map.get_mut(metadata.dataset_id()) {
                 m.remove(metadata.block_range().clone());
             }
+
+            metadata.enable_deletion();
         }
     }
 }
