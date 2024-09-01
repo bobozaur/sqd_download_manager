@@ -29,7 +29,7 @@ pub struct DataChunkMetadata {
     /// A reference to the manager's tasks.
     /// Used for adding the chunk removal task handle there so the manager can keep track of it.
     manager_tasks: BackgroundTasks,
-    /// Flag from the [`DownloadManager`] signaling whether it is live and can delete chunks.
+    /// Flag used by the [`DownloadManager`] to signal when the chunk can be deleted on drop.
     can_delete: Arc<AtomicBool>,
 }
 
@@ -105,7 +105,7 @@ impl DataChunkRef for Arc<DataChunkMetadata> {
 
 impl Drop for DataChunkMetadata {
     fn drop(&mut self) {
-        // Only delete the chunk if the download manager is live.
+        // Only delete the chunk if the download manager scheduled it.
         if self.can_delete.load(Ordering::Acquire) {
             let future = Self::delete_chunk(self.path.clone());
             self.manager_tasks.lock().unwrap().spawn(future);

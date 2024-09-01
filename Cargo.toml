@@ -10,6 +10,7 @@ rangemap = { version = "1.5" }
 tracing = { version = "0.1", features = ["log"] }
 thiserror = { version = "1" }
 futures = { version = "0.3" }
+base64 = { version = "0.22" }
 
 [dev-dependencies]
 mockito = { version = "1" }

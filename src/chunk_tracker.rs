@@ -8,6 +8,7 @@ use rangemap::RangeMap;
 
 use crate::{chunk_metadata::DataChunkMetadata, ChunkId, DatasetId};
 
+/// Struct containing maps that are used to track data chunks.
 #[derive(Default, Debug)]
 pub struct ChunkTracker {
     pub chunk_map: HashMap<ChunkId, Arc<DataChunkMetadata>>,

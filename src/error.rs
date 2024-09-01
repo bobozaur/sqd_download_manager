@@ -1,5 +1,6 @@
-use std::{io::Error as IoError, num::ParseIntError};
+use std::io::Error as IoError;
 
+use base64::DecodeSliceError;
 use reqwest::Error as ReqError;
 use thiserror::Error as ThisError;
 use tokio::task::JoinError;
@@ -31,41 +32,9 @@ pub enum DataChunkError {
     #[error("invalid chunk directory name: {0}")]
     InvalidDirName(String),
     #[error("chunk ID error: {0}")]
-    ChunkId(#[source] InvalidHexIdError),
+    ChunkId(#[source] DecodeSliceError),
     #[error("dataset ID error: {0}")]
-    DatasetId(#[source] InvalidHexIdError),
+    DatasetId(#[source] DecodeSliceError),
     #[error("error parsing chunk block range: {0}")]
-    BlockRange(#[source] ParseIntError),
-}
-
-#[derive(Debug, ThisError)]
-#[error("invalid HEX ID {id}")]
-pub struct InvalidHexIdError {
-    id: String,
-    #[source]
-    kind: IdErrorKind,
-}
-
-impl InvalidHexIdError {
-    pub(crate) fn too_short(id: String) -> Self {
-        Self {
-            id,
-            kind: IdErrorKind::TooShort,
-        }
-    }
-
-    pub(crate) fn hex_byte(id: String, error: ParseIntError) -> Self {
-        Self {
-            id,
-            kind: IdErrorKind::HexByte(error),
-        }
-    }
-}
-
-#[derive(Debug, ThisError)]
-pub enum IdErrorKind {
-    #[error("ID too short")]
-    TooShort,
-    #[error("HEX byte parsing error: {0}")]
-    HexByte(#[source] ParseIntError),
+    BlockRange(#[source] DecodeSliceError),
 }

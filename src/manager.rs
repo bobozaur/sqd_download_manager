@@ -1,11 +1,11 @@
 use std::{
     ffi::OsStr,
-    fmt::UpperHex,
     ops::Range,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
+use base64::{engine::general_purpose, Engine};
 use futures::FutureExt;
 use reqwest::{Client, Url};
 use tokio::{fs::File, io::AsyncWriteExt, task::JoinSet};
@@ -13,9 +13,7 @@ use tokio::{fs::File, io::AsyncWriteExt, task::JoinSet};
 use crate::{
     chunk_metadata::DataChunkMetadata,
     chunk_tracker::ChunkTracker,
-    error::{
-        DataChunkError, DownloadManagerError, DownloadManagerResult, InvalidHexIdError, TaskError,
-    },
+    error::{DataChunkError, DownloadManagerError, DownloadManagerResult, TaskError},
     ChunkId, DataChunk, DataChunkRef, DataManager, DatasetId,
 };
 
@@ -42,8 +40,12 @@ impl DownloadManager {
     ///
     /// The manager will by default attempt to retrieve it's state and resume where it left off.
     /// Pass [`Some(false)`] to prevent that.
+    //
+    // Typically a different method that encapsulates the restore behavior would be better.
+    // In this case though I'd say opting out of this behaviour is a more suitable choice rather
+    // than opting in, though that is of course subjective.
     #[tracing::instrument(fields(base_path = format_args!("{}", base_path.as_ref().display())), err(Debug))]
-    pub async fn new<P>(base_path: &P, resume: Option<bool>) -> DownloadManagerResult<Self>
+    pub async fn new<P>(base_path: &P, restore: Option<bool>) -> DownloadManagerResult<Self>
     where
         P: AsRef<Path>,
     {
@@ -66,7 +68,7 @@ impl DownloadManager {
             tasks,
         };
 
-        if resume.unwrap_or(true) {
+        if restore.unwrap_or(true) {
             manager.restore().await?;
         }
 
@@ -118,7 +120,7 @@ impl DownloadManager {
             };
 
             // Parse the chunk directory name and add to chunk tracker or delete it if it was marked
-            // for deletion.
+            // for deletion or the chunk download did not complete.
             let mut parts = dir_name.split(Self::FILENAME_PART_SEPARATOR);
             let mut next_part_fn = || {
                 parts
@@ -126,13 +128,27 @@ impl DownloadManager {
                     .ok_or_else(|| DataChunkError::InvalidDirName(dir_name.to_owned()))
             };
 
-            let dataset_id =
-                Self::hex_id_to_bytes(next_part_fn()?).map_err(DataChunkError::DatasetId)?;
-            let id = Self::hex_id_to_bytes(next_part_fn()?).map_err(DataChunkError::ChunkId)?;
-            let start_block =
-                u64::from_str_radix(next_part_fn()?, 16).map_err(DataChunkError::BlockRange)?;
-            let end_block =
-                u64::from_str_radix(next_part_fn()?, 16).map_err(DataChunkError::BlockRange)?;
+            let mut dataset_id = [0; 32];
+            general_purpose::STANDARD
+                .decode_slice(next_part_fn()?, &mut dataset_id)
+                .map_err(DataChunkError::DatasetId)?;
+
+            let mut id = [0; 32];
+            general_purpose::STANDARD
+                .decode_slice(next_part_fn()?, &mut id)
+                .map_err(DataChunkError::ChunkId)?;
+
+            let mut start_block = [0; 8];
+            general_purpose::STANDARD
+                .decode_slice(next_part_fn()?, &mut start_block)
+                .map_err(DataChunkError::BlockRange)?;
+            let start_block = u64::from_le_bytes(start_block);
+
+            let mut end_block = [0; 8];
+            general_purpose::STANDARD
+                .decode_slice(next_part_fn()?, &mut end_block)
+                .map_err(DataChunkError::BlockRange)?;
+            let end_block = u64::from_le_bytes(end_block);
 
             match (parts.next(), parts.next()) {
                 // No other parts in the name means the chunk directory is valid.
@@ -191,6 +207,7 @@ impl DownloadManager {
     /// Method that downloads a data chunk.
     ///
     /// It creates the chunk directory and then concurrently downloads the chunk files.
+    /// The chunk directory uses a temporary name first until all the downloads complete.
     #[tracing::instrument(skip(http_client, chunk_tracker), err(Debug))]
     async fn _download_chunk(
         http_client: Client,
@@ -300,29 +317,6 @@ impl DownloadManager {
             }
         }
     }
-
-    fn hex_id_to_bytes(s: &str) -> Result<[u8; 32], InvalidHexIdError> {
-        // Error out early if length is not exactly what we expect
-        if s.len() != 64 {
-            return Err(InvalidHexIdError::too_short(s.to_owned()));
-        }
-
-        let mut arr = [0; 32];
-
-        for (i, b) in arr.iter_mut().enumerate() {
-            let idx = i * 2;
-            let hex = s
-                .get(idx..idx + 2)
-                // Technically redundant, since we checked the length,
-                // but we might as well just repeat the error handling.
-                .ok_or_else(|| InvalidHexIdError::too_short(s.to_owned()))?;
-
-            *b = u8::from_str_radix(hex, 16)
-                .map_err(|e| InvalidHexIdError::hex_byte(s.to_owned(), e))?;
-        }
-
-        Ok(arr)
-    }
 }
 
 impl DataManager for DownloadManager {
@@ -331,14 +325,15 @@ impl DataManager for DownloadManager {
         self.evict_finished_tasks();
 
         // This chunk dir naming scheme allows us to restore the chunk tracker's state.
-        let dir_name = format!(
-            "{dataset_id:02X}{sep}{chunk_id:02X}{sep}{start_block}{sep}{end_block}",
-            sep = DownloadManager::FILENAME_PART_SEPARATOR,
-            dataset_id = UpperHexArray(chunk.dataset_id),
-            chunk_id = UpperHexArray(chunk.id),
-            start_block = chunk.block_range.start,
-            end_block = chunk.block_range.end
-        );
+        let mut dir_name = String::new();
+        general_purpose::STANDARD.encode_string(chunk.dataset_id, &mut dir_name);
+        dir_name.push_str(Self::FILENAME_PART_SEPARATOR);
+        general_purpose::STANDARD.encode_string(chunk.id, &mut dir_name);
+        dir_name.push_str(Self::FILENAME_PART_SEPARATOR);
+        general_purpose::STANDARD
+            .encode_string(chunk.block_range.start.to_le_bytes(), &mut dir_name);
+        dir_name.push_str(Self::FILENAME_PART_SEPARATOR);
+        general_purpose::STANDARD.encode_string(chunk.block_range.end.to_le_bytes(), &mut dir_name);
 
         let dir_path: Arc<Path> = self.base_path.join(dir_name).into();
         let mut tmp_dir_path = dir_path.as_os_str().to_owned();
@@ -427,16 +422,4 @@ struct ChunkFileInfo {
     tmp_dir_path: PathBuf,
     dir_path: Arc<Path>,
     download_details: Vec<(PathBuf, Url)>,
-}
-
-struct UpperHexArray([u8; 32]);
-
-impl UpperHex for UpperHexArray {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02X}")?;
-        }
-
-        Ok(())
-    }
 }
